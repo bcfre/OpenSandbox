@@ -2,6 +2,27 @@ name: Bundle Repository
 
 on:
   workflow_dispatch:
+    inputs:
+      repository:
+        description: "Repository to bundle (owner/repo)"
+        required: true
+        type: string
+        default: "opensandbox-group/OpenSandbox"
+      branch:
+        description: "Branch or tag to bundle"
+        required: true
+        type: string
+        default: "main"
+      commit:
+        description: "Commit SHA (leave empty to use branch HEAD)"
+        required: false
+        type: string
+        default: ""
+      token:
+        description: "GitHub PAT for private repos (leave empty for public)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -10,24 +31,65 @@ jobs:
   bundle:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+      - name: Clone target repository
+        id: clone
+        run: |
+          set -euo pipefail
+
+          REPO="${{ inputs.repository }}"
+          BRANCH="${{ inputs.branch }}"
+          COMMIT="${{ inputs.commit }}"
+          TOKEN="${{ inputs.token }}"
+
+          # Build clone URL
+          if [ -n "$TOKEN" ]; then
+            CLONE_URL="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          else
+            CLONE_URL="https://github.com/${REPO}.git"
+          fi
+
+          echo "Cloning ${REPO} (branch: ${BRANCH}) ..."
+          git clone --bare --branch "$BRANCH" "$CLONE_URL" repo.git
+
+          cd repo.git
+
+          # If a specific commit is requested, fetch it so it's included in the bundle
+          if [ -n "$COMMIT" ]; then
+            echo "Fetching specific commit ${COMMIT} ..."
+            git fetch origin "$COMMIT" 2>/dev/null || echo "Warning: commit ${COMMIT} not found, proceeding with branch HEAD"
+          fi
+
+          # Resolve the target: prefer explicit commit, fall back to branch HEAD
+          if [ -n "$COMMIT" ] && git cat-file -e "$COMMIT" 2>/dev/null; then
+            TARGET_COMMIT="$COMMIT"
+          else
+            TARGET_COMMIT="$(git rev-parse HEAD)"
+          fi
+          SHORT_SHA="$(git rev-parse --short "${TARGET_COMMIT}")"
+
+          # Store for later steps
+          echo "target_commit=${TARGET_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+          echo "Target: ${REPO} @ ${BRANCH}"
+          echo "Commit: ${TARGET_COMMIT}"
 
       - name: Create git bundle
         id: bundle
         run: |
           set -euo pipefail
 
+          cd repo.git
+
+          REPO_SLUG="$(echo "${{ inputs.repository }}" | tr '/' '-')"
           DATE="$(date +%Y%m%d)"
-          SHORT_SHA="$(git rev-parse --short HEAD)"
-          BUNDLE_NAME="opensandbox-bundle-${DATE}-${SHORT_SHA}.bundle"
-          TAG_NAME="bundle/${DATE}-${SHORT_SHA}"
+          SHORT_SHA="${{ steps.clone.outputs.short_sha }}"
+          BUNDLE_NAME="${REPO_SLUG}-bundle-${DATE}-${SHORT_SHA}.bundle"
+          TAG_NAME="bundle/${REPO_SLUG}/${DATE}-${SHORT_SHA}"
 
-          git bundle create "$BUNDLE_NAME" --all
+          git bundle create "../${BUNDLE_NAME}" --all
 
-          BUNDLE_SIZE="$(du -h "$BUNDLE_NAME" | cut -f1)"
+          BUNDLE_SIZE="$(du -h "../${BUNDLE_NAME}" | cut -f1)"
 
           echo "bundle_name=${BUNDLE_NAME}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
@@ -43,23 +105,28 @@ jobs:
           TAG_NAME: ${{ steps.bundle.outputs.tag_name }}
           DATE: ${{ steps.bundle.outputs.date }}
           SHORT_SHA: ${{ steps.bundle.outputs.short_sha }}
+          TARGET_COMMIT: ${{ steps.clone.outputs.target_commit }}
+          REPO: ${{ inputs.repository }}
+          BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
 
           gh release create "$TAG_NAME" "$BUNDLE_NAME" \
-            --title "Git Bundle ${DATE}-${SHORT_SHA}" \
-            --notes "Full git bundle generated on ${DATE} at commit \`${SHORT_SHA}\`.
+            --title "Git Bundle ${REPO} @ ${BRANCH} (${DATE}-${SHORT_SHA})" \
+            --notes "Git bundle of **${REPO}** generated on ${DATE}.
 
           | Item | Value |
           |------|-------|
+          | Source repo | \`${REPO}\` |
+          | Branch | \`${BRANCH}\` |
+          | Commit | \`${TARGET_COMMIT}\` |
           | Date | ${DATE} |
-          | Commit | \`${SHORT_SHA}\` |
           | Bundle | \`${BUNDLE_NAME}\` |
 
           **Usage:**
           ```bash
           git clone ${BUNDLE_NAME} /path/to/repo
           cd /path/to/repo
-          git remote add origin <original-url>
+          git remote add origin https://github.com/${REPO}.git
           git fetch origin
           ```"
